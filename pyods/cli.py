@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import logging
 import traceback
+from time import sleep
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, unquote, urlsplit, urlunsplit
 from collections import namedtuple
@@ -13,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
 
-ScrapeConfig = namedtuple("ScrapeConfig", "output loop executor base_url visited futures semaphore")
+ScrapeConfig = namedtuple("ScrapeConfig", "output loop executor base_url visited futures semaphore delay")
 """
     output: base dest dir to put downloaded files
     loop: asyncio loop object
@@ -21,6 +22,11 @@ ScrapeConfig = namedtuple("ScrapeConfig", "output loop executor base_url visited
     base_url: remote open dir base url to scan
     visited: list of urls already visiting/visited
 """
+
+
+class AlreadyDownloadedException(Exception):
+    pass
+
 
 http = Session()
 
@@ -58,7 +64,6 @@ def stream_to_file(response, url, options):
     if not local_path.startswith(options.output):
         raise Exception("Aborted: directory traversal detected!")
 
-    logging.info("Downloading {} to {}".format(url, local_path))
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     try:
         if os.path.exists(local_path):
@@ -68,20 +73,20 @@ def stream_to_file(response, url, options):
             remote_size = int(response.headers.get("Content-length"))
 
             if fsize == remote_size:
-                raise Exception("Already downloaded")
+                raise AlreadyDownloadedException("Already downloaded")
 
             logging.info("{} already exists, restarting request with range {}-{}".format(local_path, fsize,
                                                                                          remote_size))
+            if options.delay:
+                sleep(options.delay)
 
+            logging.warning("Downloading {} to {}".format(url, local_path))
             response = stream_url(url, headers={"Range": "bytes={}-{}".format(fsize, remote_size)})
-            response.raise_for_status()  #TODO: clobber file and restart w/ no range header if range not satisfiable
+            response.raise_for_status()  # TODO: clobber file and restart w/ no range header if range not satisfiable
 
         with open(local_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=256 * 1024):
                 f.write(chunk)
-    except:
-        traceback.print_exc()
-        raise
     finally:
         options.semaphore.release()
         try:
@@ -102,7 +107,7 @@ async def scrape_url(url, options, skip=False):
     g = await options.loop.run_in_executor(None, stream_url, url)
 
     if g.status_code != 200:
-        logging.warning("Fetch failed, code was %s", g.status_code)
+        logging.error("Fetch failed, code was %s", g.status_code)
         return
 
     content_type = g.headers.get("Content-Type", "")
@@ -130,24 +135,28 @@ async def scrape_url(url, options, skip=False):
                 options.futures.remove(item)
                 exc = future.exception()
                 if exc:
-                    logging.error("FAILED: %s: %s", url, exc)
+                    if type(exc) is AlreadyDownloadedException:
+                        logging.info("ALREADY COMPLETE: url: %s", url)
+                    else:
+                        logging.error("FAILED: %s: %s", url, exc)
                 else:
-                    logging.info("COMPLETED downloading url %s to %s", *future.result())
+                    logging.warning("COMPLETED downloading url %s to %s", *future.result())
 
 
 def main():
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)-15s %(levelname)-8s %(filename)s:%(lineno)d %(message)s")
-
     parser = argparse.ArgumentParser(description="Open directory scraper")
     parser.add_argument('-u', '--url', help="url to scrape")
     parser.add_argument('-o', '--output-dir', help="destination for downloaded files")
     parser.add_argument('-p', '--parallel', type=int, default=5, help="number of downloads to execute in parallel")
     parser.add_argument('-c', '--clobber', action="store_true", help="clobber existing files instead of resuming")
-
+    parser.add_argument('-d', '--delay', type=int, default=0, help="delay between requests")
+    parser.add_argument('-v', '--verbose', action="store_true", help="enable info logging")
     args = parser.parse_args()
 
-    logging.info("cli args: %s", args)
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+                        format="%(asctime)-15s %(levelname)-8s %(filename)s:%(lineno)d %(message)s")
+
+    logging.debug("cli args: %s", args)
 
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         with closing(asyncio.get_event_loop()) as loop:
@@ -162,7 +171,8 @@ def main():
                                   base_url,
                                   [],  # visited urls
                                   [],  # futures
-                                  asyncio.Semaphore(value=args.parallel))
+                                  asyncio.Semaphore(value=args.parallel),
+                                  args.delay)
 
             downloader = asyncio.ensure_future(scrape_url(base_url, config), loop=loop)
             try:
