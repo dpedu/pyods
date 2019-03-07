@@ -38,7 +38,7 @@ def clean_url(url):
     return urlunsplit(urlsplit(url))
 
 
-def stream_url(url, **kwargs):
+def stream_url(url, kwargs):
     """
     Return a request's Response object for the given URL
     """
@@ -78,7 +78,7 @@ def stream_to_file(response, url, options, local_path):
                 sleep(options.delay)
 
             logging.warning("Downloading {} to {}".format(url, local_path))
-            response = stream_url(url, headers={"Range": "bytes={}-{}".format(fsize, remote_size)})
+            response = stream_url(url, {"headers": {"Range": "bytes={}-{}".format(fsize, remote_size)}})
             response.raise_for_status()  # TODO: clobber file and restart w/ no range header if range not satisfiable
 
         with open(local_path, "wb") as f:
@@ -101,7 +101,7 @@ async def scrape_url(url, options, skip=False):
     """
     options.visited.append(url)
 
-    g = await options.loop.run_in_executor(None, stream_url, url)
+    g = await options.loop.run_in_executor(None, stream_url, url, {"headers": {"Accept-encoding": "identity"}})
 
     if g.status_code != 200:
         logging.error("Fetch failed, code was %s", g.status_code)
