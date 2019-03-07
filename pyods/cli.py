@@ -4,7 +4,7 @@ import os
 import argparse
 import asyncio
 import logging
-import traceback
+from fnmatch import fnmatch
 from time import sleep
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, unquote, urlsplit, urlunsplit
@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
 
-ScrapeConfig = namedtuple("ScrapeConfig", "output loop executor base_url visited futures semaphore delay")
+ScrapeConfig = namedtuple("ScrapeConfig", "output loop executor base_url visited futures semaphore delay exclude")
 """
     output: base dest dir to put downloaded files
     loop: asyncio loop object
@@ -58,14 +58,20 @@ def get_links(content):
 
 
 def stream_to_file(response, url, options):
-    url_suffix = url[len(options.base_url):]
-    local_path = os.path.normpath(os.path.join(options.output, unquote(url_suffix)))
+    url_suffix = unquote(url[len(options.base_url):])
+    local_path = os.path.normpath(os.path.join(options.output, url_suffix))
 
     if not local_path.startswith(options.output):
         raise Exception("Aborted: directory traversal detected!")
 
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
     try:
+        for pattern in options.exclude:
+            if fnmatch(url_suffix, pattern):
+                logging.info("Excluded: '%s' on pattern '%s'", url_suffix, pattern)
+                raise AlreadyDownloadedException("Excluded")
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
         if os.path.exists(local_path):
             response.close()
             # Local file exists, restart request with range
@@ -126,7 +132,7 @@ async def scrape_url(url, options, skip=False):
     else:
         # Actual file, download it
         # await download_file(g, url, options)
-        options.semaphore.acquire()
+        await options.semaphore.acquire()
         options.futures.append((options.executor.submit(stream_to_file, g, url, options), url, ))
         # Purge completed futures
         for item in options.futures[:]:
@@ -150,13 +156,20 @@ def main():
     parser.add_argument('-p', '--parallel', type=int, default=5, help="number of downloads to execute in parallel")
     parser.add_argument('-c', '--clobber', action="store_true", help="clobber existing files instead of resuming")
     parser.add_argument('-d', '--delay', type=int, default=0, help="delay between requests")
+    parser.add_argument('-e', '--exclude', default=[], nargs="+", help="exclude patterns")
+    parser.add_argument('-f', '--exclude-from', help="exclude patterns from file")
     parser.add_argument('-v', '--verbose', action="store_true", help="enable info logging")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(asctime)-15s %(levelname)-8s %(filename)s:%(lineno)d %(message)s")
 
     logging.debug("cli args: %s", args)
+
+    excludes = list(args.exclude)
+    if args.exclude_from:
+        with open(args.exclude_from) as f:
+            excludes += [l.strip() for l in f.readlines() if l.strip()]
 
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         with closing(asyncio.get_event_loop()) as loop:
@@ -172,7 +185,8 @@ def main():
                                   [],  # visited urls
                                   [],  # futures
                                   asyncio.Semaphore(value=args.parallel),
-                                  args.delay)
+                                  args.delay,
+                                  excludes)
 
             downloader = asyncio.ensure_future(scrape_url(base_url, config), loop=loop)
             try:
