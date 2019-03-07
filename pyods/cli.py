@@ -57,19 +57,11 @@ def get_links(content):
             yield href
 
 
-def stream_to_file(response, url, options):
-    url_suffix = unquote(url[len(options.base_url):])
-    local_path = os.path.normpath(os.path.join(options.output, url_suffix))
-
+def stream_to_file(response, url, options, local_path):
     if not local_path.startswith(options.output):
         raise Exception("Aborted: directory traversal detected!")
 
     try:
-        for pattern in options.exclude:
-            if fnmatch(url_suffix, pattern):
-                logging.info("Excluded: '%s' on pattern '%s'", url_suffix, pattern)
-                raise AlreadyDownloadedException("Excluded")
-
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
         if os.path.exists(local_path):
@@ -77,7 +69,6 @@ def stream_to_file(response, url, options):
             # Local file exists, restart request with range
             fsize = os.path.getsize(local_path)
             remote_size = int(response.headers.get("Content-length"))
-
             if fsize == remote_size:
                 raise AlreadyDownloadedException("Already downloaded")
 
@@ -132,8 +123,14 @@ async def scrape_url(url, options, skip=False):
     else:
         # Actual file, download it
         # await download_file(g, url, options)
+        url_suffix = unquote(url[len(options.base_url):])
+        local_path = os.path.normpath(os.path.join(options.output, url_suffix))
+        for pattern in options.exclude:
+            if fnmatch(url_suffix, pattern):
+                logging.info("Excluded: '%s' on pattern '%s'", url_suffix, pattern)
+                return
         await options.semaphore.acquire()
-        options.futures.append((options.executor.submit(stream_to_file, g, url, options), url, ))
+        options.futures.append((options.executor.submit(stream_to_file, g, url, options, local_path), url, ))
         # Purge completed futures
         for item in options.futures[:]:
             future, url = item
