@@ -60,7 +60,7 @@ def get_links(content):
 def stream_to_file(response, url, options, local_path):
     if not local_path.startswith(options.output):
         raise Exception("Aborted: directory traversal detected!")
-
+    seek = False
     try:
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
@@ -72,16 +72,22 @@ def stream_to_file(response, url, options, local_path):
             if fsize == remote_size:
                 raise AlreadyDownloadedException("Already downloaded")
 
-            logging.info("{} already exists, restarting request with range {}-{}".format(local_path, fsize,
+            logging.warning("{} already exists, restarting request with range {}-{}".format(local_path, fsize,
                                                                                          remote_size))
+            seek = True
             if options.delay:
                 sleep(options.delay)
 
             logging.warning("Downloading {} to {}".format(url, local_path))
-            response = stream_url(url, {"headers": {"Range": "bytes={}-{}".format(fsize, remote_size)}})
+            response = stream_url(url, {"headers": {"Range": "bytes={}-{}".format(fsize, remote_size),
+                                                    "Accept-encoding": "identity"}})
             response.raise_for_status()  # TODO: clobber file and restart w/ no range header if range not satisfiable
 
-        with open(local_path, "wb") as f:
+        with open(local_path, "ab") as f:
+            if seek:
+                f.seek(0, 2)
+            else:
+                f.seek(0)
             for chunk in response.iter_content(chunk_size=256 * 1024):
                 f.write(chunk)
     finally:
